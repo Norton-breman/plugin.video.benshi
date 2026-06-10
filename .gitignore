@@ -217,3 +217,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Artefacts de reverse-engineering (lourds / jetables, non packagés dans l'addon)
+dev/*.xapk
+dev/*.apk
+*.csv

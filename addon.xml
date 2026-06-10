@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <addon id="plugin.video.benshi"
 version="0.0.1"
-name="Benshi Video Plugin"
+name="Benshi.fr"
 provider-name="Norton-breman">
 <requires>
   <import addon="xbmc.python" version="3.0.1"/>
+  <import addon="inputstream.adaptive" optional="true"/>
 </requires>
 <extension point="xbmc.python.pluginsource" library="main.py">
   <provides>video</provides>

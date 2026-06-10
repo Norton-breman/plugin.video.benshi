@@ -1,4 +1,5 @@
 # Copyright (C) 2023, Roman V. M.
+# Copyright (C) 2026, Norton-breman (plugin.video.benshi)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,215 +14,359 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
-Example video plugin that is compatible with Kodi 20.x "Nexus" and above
-"""
-import json
-import sys
-from pathlib import Path
-from urllib.parse import urlencode, parse_qsl
+Plugin vidéo Benshi pour Kodi 20.x « Nexus » et supérieur.
 
+Authentification via les paramètres de l'addon, puis navigation dans le
+catalogue (sélections, tous les films, recherche). La lecture sera ajoutée
+à l'étape suivante.
+"""
+import os
+import sys
+from urllib.parse import parse_qsl, urlencode
+
+import xbmcaddon
 import xbmcgui
 import xbmcplugin
-from xbmcaddon import Addon
-from xbmcvfs import translatePath
+import xbmcvfs
 
-# Get the plugin url in plugin:// notation.
 URL = sys.argv[0]
-# Get a plugin handle as an integer number.
-HANDLE = int(sys.argv[1])
-# Get the addon base path. Here we use pathlib.Path for convenient path handling
-ADDON_PATH = Path(translatePath(Addon().getAddonInfo('path')))
-ICONS_DIR = ADDON_PATH / 'resources' / 'images' / 'icons'
-FANART_DIR = ADDON_PATH / 'resources' / 'images' / 'fanart'
+HANDLE = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].lstrip('-').isdigit() else -1
 
-# Public domain movies are from https://publicdomainmovie.net
-# Here we use a hardcoded list of movies from a JSON file simply for demonstrating purposes
-# In a "real life" plugin you will need to get info and links to video files/streams
-# from some website or online service.
+ADDON = xbmcaddon.Addon()
+ADDON_PATH = xbmcvfs.translatePath(ADDON.getAddonInfo('path'))
+PROFILE_PATH = xbmcvfs.translatePath(ADDON.getAddonInfo('profile'))
+ICON = ADDON.getAddonInfo('icon')
 
-MOVIES_INFO_PATH = ADDON_PATH / 'movies.json'
+sys.path.insert(0, os.path.join(ADDON_PATH, 'resources', 'lib'))
+import api        # noqa: E402
+import storage    # noqa: E402
 
+PAGE_SIZE = 30
+
+
+# --------------------------------------------------------------------- Outils
 
 def get_url(**kwargs):
-    """
-    Create a URL for calling the plugin recursively from the given set of keyword arguments.
-
-    :param kwargs: "argument=value" pairs
-    :return: plugin call URL
-    :rtype: str
-    """
-    return f'{URL}?{urlencode(kwargs)}'
+    """Construit une URL d'appel récursif du plugin."""
+    return '{}?{}'.format(URL, urlencode(kwargs))
 
 
-def get_genres():
-    """
-    Get the list of video genres
-
-    Here you can insert some code that retrieves
-    the list of video sections (in this case movie genres) from some site or API.
-
-    :return: The list of video genres
-    :rtype: list
-    """
-    with MOVIES_INFO_PATH.open('r', encoding='utf-8') as fo:
-        return json.load(fo)
+def get_api():
+    store = storage.FileTokenStore(os.path.join(PROFILE_PATH, 'token_cache.json'))
+    return api.BenshiApi(token_store=store)
 
 
-def get_videos(genre_index):
-    """
-    Get the list of videofiles/streams.
-
-    Here you can insert some code that retrieves
-    the list of video streams in the given section from some site or API.
-
-    :param genre_index: genre index
-    :type genre_index: int
-    :return: the list of videos in the category
-    :rtype: list
-    """
-    return get_genres()[genre_index]
+def get_credentials():
+    return ADDON.getSetting('email').strip(), ADDON.getSetting('password')
 
 
-def list_genres():
-    """
-    Create the list of movie genres in the Kodi interface.
-    """
-    # Set plugin category. It is displayed in some skins as the name
-    # of the current section.
-    xbmcplugin.setPluginCategory(HANDLE, 'Public Domain Movies')
-    # Set plugin content. It allows Kodi to select appropriate views
-    # for this type of content.
-    xbmcplugin.setContent(HANDLE, 'movies')
-    # Get movie genres
-    genres = get_genres()
-    # Iterate through genres
-    for index, genre_info in enumerate(genres):
-        # Create a list item with a text label.
-        list_item = xbmcgui.ListItem(label=genre_info['genre'])
-        # Set images for the list item.
-        # Convert Path objects to str because Kodi API accepts only str.
-        list_item.setArt({
-            'icon': str(ICONS_DIR / genre_info['icon']),
-            'fanart': str(FANART_DIR / genre_info['fanart']),
-        })
-        # Set additional info for the list item using its InfoTag.
-        # InfoTag allows to set various information for an item.
-        # For available properties and methods see the following link:
-        # https://codedocs.xyz/xbmc/xbmc/classXBMCAddon_1_1xbmc_1_1InfoTagVideo.html
-        # 'mediatype' is needed for a skin to display info for this ListItem correctly.
-        info_tag = list_item.getVideoInfoTag()
-        info_tag.setMediaType('video')
-        info_tag.setTitle(genre_info['genre'])
-        info_tag.setGenres([genre_info['genre']])
-        # Create a URL for a plugin recursive call.
-        # Example: plugin://plugin.video.example/?action=listing&genre_index=0
-        url = get_url(action='listing', genre_index=index)
-        # is_folder = True means that this item opens a sub-list of lower level items.
-        is_folder = True
-        # Add our item to the Kodi virtual folder listing.
-        xbmcplugin.addDirectoryItem(HANDLE, url, list_item, is_folder)
-    # Add sort methods for the virtual folder items
-    xbmcplugin.addSortMethod(HANDLE, xbmcplugin.SORT_METHOD_LABEL_IGNORE_THE)
-    # Finish creating a virtual folder.
+def notify(message, heading='Benshi', icon=xbmcgui.NOTIFICATION_INFO, time_ms=5000):
+    xbmcgui.Dialog().notification(heading, message, icon, time_ms)
+
+
+# ------------------------------------------------------------ Authentification
+
+def login():
+    """Valide l'accès au compte. Renvoie un AuthResult ou None (et prévient)."""
+    email, password = get_credentials()
+    if not email or not password:
+        notify("Renseignez vos identifiants Benshi dans les paramètres.",
+               icon=xbmcgui.NOTIFICATION_WARNING)
+        ADDON.openSettings()
+        return None
+    try:
+        return get_api().authenticate(email, password)
+    except api.BenshiAuthError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+    except api.BenshiNetworkError:
+        notify("Connexion au serveur impossible. Vérifiez votre réseau.",
+               icon=xbmcgui.NOTIFICATION_ERROR)
+    except api.BenshiError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+    return None
+
+
+def action_test_login():
+    email, password = get_credentials()
+    if not email or not password:
+        xbmcgui.Dialog().ok('Benshi', "Renseignez d'abord votre e-mail et votre mot de passe.")
+        return
+    try:
+        result = get_api().authenticate(email, password)
+    except api.BenshiAuthError as exc:
+        xbmcgui.Dialog().ok('Benshi', "Échec de la connexion :\n%s" % exc)
+        return
+    except api.BenshiError as exc:
+        xbmcgui.Dialog().ok('Benshi', "Erreur :\n%s" % exc)
+        return
+    abo = "actif" if result.is_subscribed else "inactif"
+    xbmcgui.Dialog().ok('Benshi', "Connexion réussie.\n\nCompte : %s\nAbonnement : %s"
+                        % (result.display_name, abo))
+
+
+# -------------------------------------------------------------------- Catalogue
+
+def list_root():
+    """Menu principal du plugin."""
+    xbmcplugin.setPluginCategory(HANDLE, 'Benshi')
+    xbmcplugin.setContent(HANDLE, 'videos')
+    entries = [('Sélections', get_url(action='selections'))]
+    # Une entrée par dimension de filtrage (tranche d'âge, type, thème, pays).
+    for label, detail_id, title in api.FILTER_DIMENSIONS:
+        entries.append((title, get_url(action='dimension', label=label,
+                                       detail_id=detail_id, title=title)))
+    entries.append(('Tous les films', get_url(action='allfilms', page=1)))
+    entries.append(('Rechercher', get_url(action='search')))
+    for label, url in entries:
+        item = xbmcgui.ListItem(label=label)
+        item.setArt({'icon': ICON, 'thumb': ICON})
+        xbmcplugin.addDirectoryItem(HANDLE, url, item, isFolder=True)
     xbmcplugin.endOfDirectory(HANDLE)
 
 
-def list_videos(genre_index):
-    """
-    Create the list of playable videos in the Kodi interface.
-
-    :param genre_index: the index of genre in the list of movie genres
-    :type genre_index: int
-    """
-    genre_info = get_videos(genre_index)
-    # Set plugin category. It is displayed in some skins as the name
-    # of the current section.
-    xbmcplugin.setPluginCategory(HANDLE, genre_info['genre'])
-    # Set plugin content. It allows Kodi to select appropriate views
-    # for this type of content.
-    xbmcplugin.setContent(HANDLE, 'movies')
-    # Get the list of videos in the category.
-    videos = genre_info['movies']
-    # Iterate through videos.
-    for video in videos:
-        # Create a list item with a text label
-        list_item = xbmcgui.ListItem(label=video['title'])
-        # Set graphics (thumbnail, fanart, banner, poster, landscape etc.) for the list item.
-        # Here we use only poster for simplicity's sake.
-        # In a real-life plugin you may need to set multiple image types.
-        list_item.setArt({'poster': video['poster']})
-        # Set additional info for the list item via InfoTag.
-        # 'mediatype' is needed for skin to display info for this ListItem correctly.
-        info_tag = list_item.getVideoInfoTag()
-        info_tag.setMediaType('movie')
-        info_tag.setTitle(video['title'])
-        info_tag.setGenres([genre_info['genre']])
-        info_tag.setPlot(video['plot'])
-        info_tag.setYear(video['year'])
-        # Set 'IsPlayable' property to 'true'.
-        # This is mandatory for playable items!
-        list_item.setProperty('IsPlayable', 'true')
-        # Create a URL for a plugin recursive call.
-        # Example: plugin://plugin.video.example/?action=play&video=https%3A%2F%2Fia600702.us.archive.org%2F3%2Fitems%2Firon_mask%2Firon_mask_512kb.mp4
-        url = get_url(action='play', video=video['url'])
-        # Add the list item to a virtual Kodi folder.
-        # is_folder = False means that this item won't open any sub-list.
-        is_folder = False
-        # Add our item to the Kodi virtual folder listing.
-        xbmcplugin.addDirectoryItem(HANDLE, url, list_item, is_folder)
-    # Add sort methods for the virtual folder items
-    xbmcplugin.addSortMethod(HANDLE, xbmcplugin.SORT_METHOD_LABEL_IGNORE_THE)
-    xbmcplugin.addSortMethod(HANDLE, xbmcplugin.SORT_METHOD_VIDEO_YEAR)
-    # Finish creating a virtual folder.
+def list_dimension(label, detail_id, title):
+    """Liste les valeurs d'une dimension (ex. les tranches d'âge) comme dossiers."""
+    xbmcplugin.setPluginCategory(HANDLE, title)
+    xbmcplugin.setContent(HANDLE, 'videos')
+    try:
+        values = get_api().get_metadata_values(detail_id)
+    except api.BenshiError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    for value in values:
+        name = value.get('name') or ''
+        item = xbmcgui.ListItem(label=name)
+        item.setArt(api.picture_art(value.get('picture')) or {'icon': ICON})
+        url = get_url(action='filter', label=label, value=value.get('id'),
+                      title=name, page=1)
+        xbmcplugin.addDirectoryItem(HANDLE, url, item, isFolder=True)
     xbmcplugin.endOfDirectory(HANDLE)
 
 
-def play_video(path):
-    """
-    Play a video by the provided path.
+def list_filter(label, value, title, page):
+    """Liste les films filtrés sur une valeur de dimension (paginé)."""
+    xbmcplugin.setPluginCategory(HANDLE, title)
+    xbmcplugin.setContent(HANDLE, 'movies')
+    try:
+        programs, pagination = get_api().filter_programs(label, value, page=page, count=PAGE_SIZE)
+    except api.BenshiError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    for program in programs:
+        add_program_item(program)
+    _add_next_page(pagination, lambda p: get_url(action='filter', label=label,
+                                                 value=value, title=title, page=p))
+    xbmcplugin.addSortMethod(HANDLE, xbmcplugin.SORT_METHOD_LABEL_IGNORE_THE)
+    xbmcplugin.endOfDirectory(HANDLE)
 
-    :param path: Fully-qualified video URL
-    :type path: str
-    """
-    # Create a playable item with a path to play.
-    # offscreen=True means that the list item is not meant for displaying,
-    # only to pass info to the Kodi player
-    play_item = xbmcgui.ListItem(offscreen=True)
-    play_item.setPath(path)
-    # Pass the item to the Kodi player.
-    xbmcplugin.setResolvedUrl(HANDLE, True, listitem=play_item)
 
+def list_selections():
+    xbmcplugin.setPluginCategory(HANDLE, 'Sélections')
+    xbmcplugin.setContent(HANDLE, 'videos')
+    try:
+        selections = get_api().get_selections()
+    except api.BenshiError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    for sel in selections:
+        item = xbmcgui.ListItem(label=sel.get('title') or '')
+        item.setArt(api.picture_art(sel.get('picture')) or {'icon': ICON})
+        info = item.getVideoInfoTag()
+        info.setTitle(sel.get('title') or '')
+        if sel.get('description'):
+            info.setPlot(sel['description'])
+        url = get_url(action='selection', selection_id=sel.get('id'))
+        xbmcplugin.addDirectoryItem(HANDLE, url, item, isFolder=True)
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def list_selection(selection_id):
+    xbmcplugin.setContent(HANDLE, 'movies')
+    try:
+        title, programs = get_api().get_selection_programs(selection_id)
+    except api.BenshiError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    xbmcplugin.setPluginCategory(HANDLE, title or 'Sélection')
+    for program in programs:
+        add_program_item(program)
+    xbmcplugin.addSortMethod(HANDLE, xbmcplugin.SORT_METHOD_LABEL_IGNORE_THE)
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def list_all_films(page):
+    xbmcplugin.setPluginCategory(HANDLE, 'Tous les films')
+    xbmcplugin.setContent(HANDLE, 'movies')
+    try:
+        programs, pagination = get_api().get_programs(page=page, count=PAGE_SIZE)
+    except api.BenshiError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    for program in programs:
+        add_program_item(program)
+    _add_next_page(pagination, lambda p: get_url(action='allfilms', page=p))
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def do_search(page, query=None):
+    if not query:
+        query = xbmcgui.Dialog().input('Rechercher un film')
+        if not query:
+            xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+            return
+    xbmcplugin.setPluginCategory(HANDLE, 'Recherche : %s' % query)
+    xbmcplugin.setContent(HANDLE, 'movies')
+    try:
+        programs, pagination = get_api().search_programs(query, page=page, count=PAGE_SIZE)
+    except api.BenshiError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    if not programs:
+        notify("Aucun résultat pour « %s »." % query)
+    for program in programs:
+        add_program_item(program)
+    _add_next_page(pagination, lambda p: get_url(action='search', page=p, query=query))
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def add_program_item(program):
+    """Ajoute un programme au listing : dossier d'épisodes si série, sinon film jouable."""
+    title = program.get('title') or ''
+    item = xbmcgui.ListItem(label=title)
+    item.setArt(api.picture_art(program.get('picture')) or {'icon': ICON})
+    info = item.getVideoInfoTag()
+    info.setTitle(title)
+    if program.get('synopsis'):
+        info.setPlot(program['synopsis'])
+    year = program.get('date_aaaa')
+    if isinstance(year, int) or (isinstance(year, str) and year.isdigit()):
+        info.setYear(int(year))
+
+    if api.is_series(program):
+        # Série : on ouvre la liste des épisodes au lieu de lancer la lecture.
+        info.setMediaType('tvshow')
+        url = get_url(action='serie', serie_id=program.get('serie_id'), title=title)
+        xbmcplugin.addDirectoryItem(HANDLE, url, item, isFolder=True)
+        return
+
+    info.setMediaType('movie')
+    duration = program.get('duration')
+    if isinstance(duration, int) and duration > 0:
+        info.setDuration(duration)
+    item.setProperty('IsPlayable', 'true')
+    video_id = api.main_video_id(program)
+    if video_id:
+        url = get_url(action='play', video_id=video_id)
+    else:
+        url = get_url(action='play', program_id=program.get('id'))
+    xbmcplugin.addDirectoryItem(HANDLE, url, item, isFolder=False)
+
+
+def list_episodes(serie_id, title):
+    """Liste les épisodes d'une série (chacun jouable)."""
+    xbmcplugin.setPluginCategory(HANDLE, title)
+    xbmcplugin.setContent(HANDLE, 'episodes')
+    try:
+        episodes = get_api().get_episodes(serie_id)
+    except api.BenshiError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    for episode in episodes:
+        add_program_item(episode)
+    xbmcplugin.endOfDirectory(HANDLE)
+
+
+def _add_next_page(pagination, url_builder):
+    """Ajoute un élément « Page suivante » si la pagination le permet."""
+    current = pagination.get('current_page') or 1
+    last = pagination.get('last_page') or pagination.get('total_pages') or current
+    if current < last:
+        item = xbmcgui.ListItem(label='Page suivante (%d/%d) »' % (current + 1, last))
+        item.setArt({'icon': ICON})
+        xbmcplugin.addDirectoryItem(HANDLE, url_builder(current + 1), item, isFolder=True)
+
+
+def play_program(video_id=None, program_id=None):
+    """Résout et lance la lecture d'une vidéo (flux HLS/DASH via InputStream Adaptive)."""
+    client = get_api()
+    try:
+        if not video_id and program_id:
+            video_id = api.main_video_id(client.get_program(program_id))
+        if not video_id:
+            raise api.BenshiError("Vidéo introuvable pour ce programme.")
+        video = client.get_video(video_id)
+    except api.BenshiError as exc:
+        notify(str(exc), icon=xbmcgui.NOTIFICATION_ERROR)
+        xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
+        return
+
+    stream = api.pick_stream(video)
+    if not stream:
+        notify("Aucun flux disponible pour cette vidéo.", icon=xbmcgui.NOTIFICATION_ERROR)
+        xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
+        return
+
+    item = xbmcgui.ListItem(path=stream['url'])
+    is_dash = stream['manifest_type'] == 'mpd'
+    item.setMimeType('application/dash+xml' if is_dash else 'application/x-mpegURL')
+    item.setContentLookup(False)
+    # Lecture via InputStream Adaptive (obligatoire pour le DASH).
+    item.setProperty('inputstream', 'inputstream.adaptive')
+    item.setProperty('inputstream.adaptive.manifest_type', stream['manifest_type'])
+    if stream.get('drm_url'):
+        item.setProperty('inputstream.adaptive.license_type', 'com.widevine.alpha')
+        item.setProperty('inputstream.adaptive.license_key', stream['drm_url'])
+    xbmcplugin.setResolvedUrl(HANDLE, True, item)
+
+
+# ----------------------------------------------------------------------- Router
 
 def router(paramstring):
-    """
-    Router function that calls other functions
-    depending on the provided paramstring
-
-    :param paramstring: URL encoded plugin paramstring
-    :type paramstring: str
-    """
-    # Parse a URL-encoded paramstring to the dictionary of
-    # {<parameter>: <value>} elements
     params = dict(parse_qsl(paramstring))
-    # Check the parameters passed to the plugin
-    if not params:
-        # If the plugin is called from Kodi UI without any parameters,
-        # display the list of video categories
-        list_genres()
-    elif params['action'] == 'listing':
-        # Display the list of videos in a provided category.
-        list_videos(int(params['genre_index']))
-    elif params['action'] == 'play':
-        # Play a video from a provided URL.
-        play_video(params['video'])
-    else:
-        # If the provided paramstring does not contain a supported action
-        # we raise an exception. This helps to catch coding errors,
-        # e.g. typos in action names.
-        raise ValueError(f'Invalid paramstring: {paramstring}!')
+    action = params.get('action')
+
+    if action == 'testlogin':
+        action_test_login()
+        return
+    if action == 'selections':
+        list_selections()
+        return
+    if action == 'selection':
+        list_selection(params.get('selection_id'))
+        return
+    if action == 'serie':
+        list_episodes(params.get('serie_id'), params.get('title', ''))
+        return
+    if action == 'dimension':
+        list_dimension(params.get('label'), params.get('detail_id'), params.get('title', ''))
+        return
+    if action == 'filter':
+        list_filter(params.get('label'), params.get('value'),
+                    params.get('title', ''), int(params.get('page', 1)))
+        return
+    if action == 'allfilms':
+        list_all_films(int(params.get('page', 1)))
+        return
+    if action == 'search':
+        do_search(int(params.get('page', 1)), params.get('query'))
+        return
+    if action == 'play':
+        play_program(video_id=params.get('video_id'), program_id=params.get('program_id'))
+        return
+
+    # Racine : on valide l'accès au compte avant d'ouvrir le catalogue.
+    if login() is None:
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+    list_root()
 
 
 if __name__ == '__main__':
-    # Call the router function and pass the plugin call parameters to it.
-    # We use string slicing to trim the leading '?' from the plugin call paramstring
-    router(sys.argv[2][1:])
+    router(sys.argv[2][1:] if len(sys.argv) > 2 else '')

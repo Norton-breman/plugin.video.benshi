@@ -1,0 +1,26 @@
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: plugin.video.benshi\n"
+"Report-Msgid-Bugs-To: \n"
+"Language-Team: French\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: fr_FR\n"
+
+msgctxt "#30000"
+msgid "Account"
+msgstr "Compte"
+
+msgctxt "#30001"
+msgid "Email address"
+msgstr "Adresse e-mail"
+
+msgctxt "#30002"
+msgid "Password"
+msgstr "Mot de passe"
+
+msgctxt "#30003"
+msgid "Test connection"
+msgstr "Tester la connexion"
